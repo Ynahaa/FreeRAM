@@ -85,9 +85,9 @@ _standby_cache_val = 0.0
 _standby_cache_time = 0.0
 _STANDBY_CACHE_TTL = 10.0  # PowerShell 查询结果缓存 10 秒
 
-def get_memory_info() -> dict:
+def get_memory_info(fast: bool = False) -> dict:
     mem = psutil.virtual_memory()
-    standby = _get_standby_size_mb(mem)
+    standby = _get_standby_size_mb(mem, fast=fast)
     return {
         "total_mb":     round(mem.total / 1048576, 1),
         "available_mb": round(mem.available / 1048576, 1),
@@ -95,8 +95,9 @@ def get_memory_info() -> dict:
         "standby_mb":   standby,
     }
 
-def _get_standby_size_mb(mem=None) -> float:
-    """获取备用列表大小。psutil 优先，失败则 PowerShell，结果缓存 10 秒。"""
+def _get_standby_size_mb(mem=None, fast: bool = False) -> float:
+    """获取备用列表大小。psutil 优先，失败则 PowerShell（除非 fast=True）。
+    fast 模式跳过 PowerShell，避免阻塞手动清理。结果缓存 10 秒。"""
     global _standby_cache_val, _standby_cache_time
 
     # 优先用 psutil（零开销）
@@ -113,6 +114,10 @@ def _get_standby_size_mb(mem=None) -> float:
     now = time.time()
     if _standby_cache_val > 0 and (now - _standby_cache_time) < _STANDBY_CACHE_TTL:
         return _standby_cache_val
+
+    # fast 模式：跳过 PowerShell，避免阻塞 UI 操作
+    if fast:
+        return 0.0
 
     # 回退：PowerShell（缓存结果 10 秒）
     try:
@@ -136,6 +141,11 @@ def _get_standby_size_mb(mem=None) -> float:
 def clean_standby_list() -> bool:
     if _try_nt_clean():
         return True
+    # 内存紧张时跳过 VirtualAlloc/bytearray 加压——先申请 200+MB 只会火上浇油
+    mem = psutil.virtual_memory()
+    if mem.percent > 85:
+        logger.debug("内存紧张 (%.1f%%)，跳过 VirtualAlloc/bytearray 加压", mem.percent)
+        return False
     b_ok = _try_virtual_alloc_pressure(mb=256)
     if not b_ok:
         logger.debug("VirtualAlloc 失败，回退 bytearray")
@@ -485,10 +495,10 @@ def is_feedback_cooldown_active() -> bool:
 
 # ── 组合 ──────────────────────────────────────────────
 def full_clean(process_name: str = "DeltaForceClient.exe") -> dict:
-    before = get_memory_info()
+    before = get_memory_info(fast=True)   # fast: 跳过 PowerShell，避免阻塞
     clean_standby_list()
     trimmed = trim_process_workset(process_name)
-    after = get_memory_info()
+    after = get_memory_info(fast=True)
     freed_mb = round(after["available_mb"] - before["available_mb"], 1) if after["available_mb"] > before["available_mb"] else 0
     return {
         "before_available_mb": before["available_mb"],

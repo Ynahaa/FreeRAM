@@ -353,6 +353,11 @@ class MemCleanGUI:
         self._sync_timer.timeout.connect(self._sync)
         self._sync_timer.start(2000)
 
+        self._clean_done = False
+        self._clean_check_timer = QTimer()
+        self._clean_check_timer.timeout.connect(self._check_clean_done)
+        self._clean_check_timer.start(300)  # 轮询清理完成标志，可靠恢复按钮
+
         self._load_winpos()
         self._refresh()
 
@@ -629,6 +634,7 @@ class MemCleanGUI:
 
     def _on_clean(self):
         self.clean_btn.setText("清理中..."); self.clean_btn.setEnabled(False)
+
         def do():
             try:
                 from memory_cleaner import full_clean
@@ -641,13 +647,19 @@ class MemCleanGUI:
                 self.collector.update_clean_stats(
                     self.tray.clean_count, r["freed_mb_estimate"],
                     r["processes_trimmed"], self.tray.total_freed_mb)
-                QTimer.singleShot(0, lambda: None)
-            except Exception as e:
-                QTimer.singleShot(0, lambda: None)
+            except Exception:
+                pass
             finally:
-                QTimer.singleShot(0, lambda: self.clean_btn.setEnabled(True))
-                QTimer.singleShot(0, lambda: self.clean_btn.setText("立即清理"))
+                self._clean_done = True  # 标志位，由 GUI 线程轮询恢复按钮
+
         threading.Thread(target=do, daemon=True).start()
+
+    def _check_clean_done(self):
+        """GUI 线程轮询：清理完成后恢复按钮。用标志位替代跨线程 QTimer。"""
+        if self._clean_done:
+            self._clean_done = False
+            self.clean_btn.setEnabled(True)
+            self.clean_btn.setText("立即清理")
 
     def _on_game_state(self, running: bool):
         if not self.tray.config.get("notify_game_state", True):
