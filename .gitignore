@@ -6,3 +6,4 @@ __pycache__/
 .winpos
 log.txt*
 config.json
+dev/
