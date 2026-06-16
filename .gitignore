@@ -1,0 +1,8 @@
+dist/
+build/
+__pycache__/
+*.spec
+.hwnd
+.winpos
+log.txt*
+config.json
