@@ -219,7 +219,7 @@ def _is_system_process(pid: int) -> bool:
     捕获白名单里没有的新系统进程名。"""
     try:
         exe_path = psutil.Process(pid).exe().lower()
-        return exe_path.startswith(r"c:\windows\")
+        return exe_path.startswith("c:\\windows\\")
     except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
         return True  # 读不到路径 → 保守处理，当作系统进程不碰
 

@@ -35,6 +35,8 @@ python -m PyInstaller ^
     --icon "FreeRAM.ico" ^
     --hidden-import psutil ^
     --hidden-import PySide6 ^
+    --hidden-import memory_cleaner ^
+    --hidden-import safe_detector ^
     --clean ^
     main.py
 

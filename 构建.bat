@@ -15,7 +15,7 @@ if exist "FreeRAM.spec" del /q "FreeRAM.spec"
 echo [2/4] Cleaned old build
 
 echo [3/4] Building...
-python -m PyInstaller --onefile --windowed --name "FreeRAM" --icon "FreeRAM.ico" --hidden-import psutil --hidden-import PySide6 --clean main.py
+python -m PyInstaller --onefile --windowed --name "FreeRAM" --icon "FreeRAM.ico" --hidden-import psutil --hidden-import PySide6 --hidden-import memory_cleaner --hidden-import safe_detector --clean main.py
 
 if %errorlevel% neq 0 (
     echo [ERROR] Build failed!
