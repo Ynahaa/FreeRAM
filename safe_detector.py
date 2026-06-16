@@ -8,6 +8,7 @@ safe_detector.py — 安全时机检测
 """
 
 import time
+import threading
 import psutil
 import ctypes
 from ctypes import wintypes, byref
@@ -43,56 +44,139 @@ def memory_is_tight() -> bool:
 
     return False
 
-_game_pid_cache: int | None = None
-_game_proc_cache = None
-_game_cpu_cache: float = 0.0
-_game_running_cache: bool = False
+# 多进程缓存 —— {原始进程名: 值}
+_game_pid_cache: dict[str, int | None] = {}
+_game_proc_cache: dict[str, object] = {}
+_game_cpu_cache: dict[str, float] = {}
+_game_running_cache: dict[str, bool] = {}
+_prev_game_running: dict[str, bool] = {}  # 上一轮状态，用于检测变化
+_pending_changes: list[tuple[str, bool]] = []  # 待消费的状态变化 (name, is_running)
+_pending_lock = threading.Lock()
 _pid_check_counter = 0
 
 
+def force_rescan():
+    """强制下一轮 is_game_idle 立即重扫进程列表（保存设置后调用）。"""
+    global _pid_check_counter
+    _pid_check_counter = 5
+
+
 def is_game_idle(process_name: str = "DeltaForceClient.exe") -> bool:
-    global _game_pid_cache, _game_proc_cache, _game_cpu_cache, _game_running_cache, _pid_check_counter
+    global _game_pid_cache, _game_proc_cache, _game_cpu_cache
+    global _game_running_cache, _prev_game_running, _pending_changes, _pid_check_counter
     _pid_check_counter += 1
 
-    if _pid_check_counter >= 5 or _game_pid_cache is None:
+    targets = [n.strip().lower() for n in process_name.split(",") if n.strip()]
+    target_set = set(targets)
+
+    if _pid_check_counter >= 5 or not _game_running_cache:
         _pid_check_counter = 0
-        _game_pid_cache = None; _game_proc_cache = None
-        _game_running_cache = False
-        targets = [n.strip().lower() for n in process_name.split(",") if n.strip()]
+        # 保存旧状态用于检测变化
+        _prev_game_running = dict(_game_running_cache)
+        # 重置缓存
+        _game_pid_cache.clear()
+        _game_proc_cache.clear()
+        _game_cpu_cache.clear()
+        _game_running_cache.clear()
+
+        # 扫描所有进程，匹配全部目标
         for proc in psutil.process_iter(["name", "pid"]):
             try:
-                if proc.info["name"].lower() in targets:
-                    _game_pid_cache = proc.info["pid"]; break
+                nl = proc.info["name"].lower()
+                if nl in target_set and nl not in _game_pid_cache:
+                    _game_pid_cache[nl] = proc.info["pid"]
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
 
-    if _game_pid_cache is not None:
+        # 更新每个目标的运行状态和 CPU（必须在变化检测之前）
+        for name in targets:
+            pid = _game_pid_cache.get(name)
+            if pid is None:
+                _game_running_cache[name] = False
+                _game_cpu_cache[name] = 0.0
+                continue
+            try:
+                proc = _game_proc_cache.get(name)
+                if proc is None or proc.pid != pid:
+                    proc = psutil.Process(pid)
+                    _game_proc_cache[name] = proc
+                if proc.is_running():
+                    try:
+                        cpu = proc.cpu_percent()
+                    except Exception:
+                        cpu = 0.0
+                    _game_cpu_cache[name] = cpu
+                    _game_running_cache[name] = True
+                else:
+                    _game_pid_cache[name] = None
+                    _game_running_cache[name] = False
+                    _game_cpu_cache[name] = 0.0
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                _game_pid_cache[name] = None
+                _game_running_cache[name] = False
+                _game_cpu_cache[name] = 0.0
+
+        # 检测状态变化（状态更新后执行，加锁 + 去重）
+        with _pending_lock:
+            for name in targets:
+                was = _prev_game_running.get(name, False)
+                now = _game_running_cache.get(name, False)
+                if was != now:
+                    item = (name, now)
+                    if item not in _pending_changes:
+                        _pending_changes.append(item)
+
+            for old_name in _prev_game_running:
+                if old_name not in target_set and _prev_game_running[old_name]:
+                    item = (old_name, False)
+                    if item not in _pending_changes:
+                        _pending_changes.append(item)
+
+    # ── 非重扫轮次：仅更新 CPU 和空闲判断 ──
+    all_idle = True
+    for name in targets:
+        pid = _game_pid_cache.get(name)
+        if pid is None:
+            continue
         try:
-            if _game_proc_cache is None or _game_proc_cache.pid != _game_pid_cache:
-                _game_proc_cache = psutil.Process(_game_pid_cache)
-            if _game_proc_cache.is_running():
+            proc = _game_proc_cache.get(name)
+            if proc is not None and proc.is_running():
                 try:
-                    _game_cpu_cache = _game_proc_cache.cpu_percent()
+                    cpu = proc.cpu_percent()
                 except Exception:
-                    _game_cpu_cache = 0.0
-                _game_running_cache = True
-                return _game_cpu_cache < GAME_CPU_IDLE_THRESHOLD
-            else:
-                _game_pid_cache = None; _game_proc_cache = None
-                _game_running_cache = False
+                    cpu = 0.0
+                _game_cpu_cache[name] = cpu
+                if cpu >= GAME_CPU_IDLE_THRESHOLD:
+                    all_idle = False
         except (psutil.NoSuchProcess, psutil.AccessDenied):
-            _game_pid_cache = None; _game_proc_cache = None
-            _game_running_cache = False
+            pass
 
-    return True
+    return all_idle
 
 
-def get_cached_game_state() -> tuple[bool, float, int | None]:
+def get_cached_game_state() -> tuple[bool, float, dict, list]:
     """
-    返回缓存的游戏状态——供 GUI DataCollector 复用，避免重复扫描进程列表。
-    返回 (运行中, CPU%, PID)。由 is_game_idle() 每 5 秒更新缓存。
+    返回缓存的游戏状态——供 GUI DataCollector 复用。
+    返回 (any_running, max_cpu, {name: {running, cpu, pid}}, changed_list)
+    changed_list = [(name, is_running), ...]，消费后清空。
     """
-    return (_game_running_cache, _game_cpu_cache, _game_pid_cache)
+    global _pending_changes
+    states = {}
+    any_running = False
+    max_cpu = 0.0
+    for name, pid in _game_pid_cache.items():
+        running = _game_running_cache.get(name, False)
+        cpu = _game_cpu_cache.get(name, 0.0)
+        states[name] = {"running": running, "cpu": cpu, "pid": pid}
+        if running:
+            any_running = True
+            if cpu > max_cpu:
+                max_cpu = cpu
+
+    with _pending_lock:
+        changes = list(_pending_changes)
+        _pending_changes.clear()
+    return (any_running, max_cpu, states, changes)
 
 # ── 前台窗口 ──────────────────────────────────────────
 def _get_foreground_process_name() -> str | None:
@@ -143,7 +227,8 @@ def is_safe_to_clean(process_name: str = "DeltaForceClient.exe") -> tuple[bool, 
         standby = (mem.cached or 0) / 1048576
     tight = memory_is_tight()
     fg = is_game_in_foreground(process_name)
-    gidle = is_game_idle(process_name) if fg else True
+    # 始终调用 is_game_idle 以更新共享缓存（供 GUI 显示和 Tier 3 使用）
+    gidle = is_game_idle(process_name)
 
     log.info(
         f"[检测] 可用 {avail_pct:.1f}% | 备用 {standby:.0f}MB | "

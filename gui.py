@@ -61,10 +61,10 @@ class DataCollector:
         self._running = True
         self.total_mb = self.available_mb = self.used_pct = self.standby_mb = 0.0
         self.game_running = False; self.game_cpu = 0.0
+        self.game_states: dict = {}   # {name: {running, cpu, pid}}
         self.clean_count = 0; self.last_freed_mb = 0.0; self.last_trimmed = 0
         self.total_freed_mb = 0.0; self.is_paused = False; self.last_clean_time = ""
         self.clean_history: list = []   # [(time_str, freed_mb, reason), ...]
-        self._was_game_running = False
         self._on_game_state_change = None
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -81,17 +81,18 @@ class DataCollector:
                     standby_mb = _get_standby_size_mb(mem)
                 except: standby_mb = 0.0
 
-                # 游戏状态：复用 safe_detector 的共享缓存（避免重复扫描进程列表）
+                # 游戏状态：复用 safe_detector 的共享缓存
                 try:
                     from safe_detector import get_cached_game_state
-                    game_running, game_cpu, _ = get_cached_game_state()
+                    game_running, game_cpu, states, changes = get_cached_game_state()
                 except Exception:
-                    game_running, game_cpu = False, 0.0
+                    game_running, game_cpu, states, changes = False, 0.0, {}, []
 
-                if game_running != self._was_game_running:
-                    self._was_game_running = game_running
+                # 逐个进程通知状态变化
+                for name, is_running in changes:
                     cb = getattr(self, '_on_game_state_change', None)
-                    if cb: cb(game_running)
+                    if cb:
+                        cb(name, is_running)
 
                 with self._lock:
                     self.total_mb = round(total_mb, 1)
@@ -100,6 +101,7 @@ class DataCollector:
                     self.standby_mb = round(standby_mb, 1)
                     self.game_running = game_running
                     self.game_cpu = game_cpu
+                    self.game_states = states
             except: pass
             time.sleep(1)
 
@@ -107,7 +109,8 @@ class DataCollector:
         with self._lock:
             return {k: getattr(self, k) for k in [
                 "total_mb","available_mb","used_pct","standby_mb",
-                "game_running","game_cpu","clean_count","last_freed_mb",
+                "game_running","game_cpu","game_states",
+                "clean_count","last_freed_mb",
                 "last_trimmed","total_freed_mb","is_paused","last_clean_time"]}
 
     def update_clean_stats(self, a, b, c, d):
@@ -545,13 +548,40 @@ class MemCleanGUI:
                 f"可用 {s['available_mb']:.0f} MB  ·  备用 {s['standby_mb']:.0f} MB  ·  总计 {s['total_mb']:.0f} MB"
             )
 
-            # 游戏状态
-            if s["game_running"]:
-                self.game_dot.setStyleSheet("color: #10B981; font-size: 12px; border: none; background: transparent;")
-                self.game_label.setText(f"运行中  CPU {s['game_cpu']:.0f}%")
+            # 游戏状态 — 多进程逐行显示
+            if s.get("is_paused"):
+                gray = "#6B7280" if self._dark else "#D1D5DB"
+                self.game_dot.setStyleSheet(
+                    f"color: {gray}; font-size: 12px; "
+                    f"border: none; background: transparent;")
+                self.game_label.setText("已暂停监控")
             else:
-                self.game_dot.setStyleSheet(f"color: {'#6B7280' if self._dark else '#D1D5DB'}; font-size: 12px; border: none; background: transparent;")
-                self.game_label.setText("未运行")
+                states = s.get("game_states", {})
+                if states:
+                    green = "#10B981"
+                    gray = "#6B7280" if self._dark else "#D1D5DB"
+                    lines = []
+                    any_running = False
+                    for name, st in states.items():
+                        if st["running"]:
+                            any_running = True
+                            lines.append(
+                                f'<span style="color:{green};">●</span> {name}'
+                                f'  CPU {st["cpu"]:.0f}%')
+                        else:
+                            lines.append(
+                                f'<span style="color:{gray};">○</span> {name}'
+                                f'  未运行')
+                    self.game_dot.setStyleSheet(
+                        f"color: {green if any_running else gray}; font-size: 12px; "
+                        f"border: none; background: transparent;")
+                    self.game_label.setText("<br>".join(lines))
+                else:
+                    gray = "#6B7280" if self._dark else "#D1D5DB"
+                    self.game_dot.setStyleSheet(
+                        f"color: {gray}; font-size: 12px; "
+                        f"border: none; background: transparent;")
+                    self.game_label.setText("未运行")
 
             # 清理统计
             if s["last_freed_mb"] > 0:
@@ -661,16 +691,16 @@ class MemCleanGUI:
             self.clean_btn.setEnabled(True)
             self.clean_btn.setText("立即清理")
 
-    def _on_game_state(self, running: bool):
+    def _on_game_state(self, name: str, running: bool):
         if not self.tray.config.get("notify_game_state", True):
             return
         if running:
             self.tray.tray.showMessage(
-                "FreeRAM", f"🎮 {self.process_name} 已启动",
+                "FreeRAM", f"🎮 {name} 已启动",
                 QSystemTrayIcon.MessageIcon.Information, 3000)
         else:
             self.tray.tray.showMessage(
-                "FreeRAM", f"🛑 {self.process_name} 已退出",
+                "FreeRAM", f"🛑 已停止监控 {name}",
                 QSystemTrayIcon.MessageIcon.Information, 3000)
 
     # ── Settings ─────────────────────────────────
@@ -751,6 +781,43 @@ class MemCleanGUI:
 
         section("基础设置")
         pn = srow("进程名 (可设置多个进程，用逗号分隔)", cfg.get("process_name", ""))
+
+        # ── 进程名查重 ──
+        dup_warn = QLabel("")
+        dup_warn.setStyleSheet("color: #EF4444; font-size: 11px; font-weight: bold; padding: 2px 0;")
+        dup_warn.setWordWrap(True)
+        dup_warn.hide()
+        l.addWidget(dup_warn)
+
+        def _dedup_process_name(text: str):
+            pn.blockSignals(True)
+            try:
+                items = [x.strip() for x in text.split(",")]
+                seen = set()
+                unique = []
+                has_dup = False
+                for item in items:
+                    if not item:
+                        unique.append(item)
+                        continue
+                    lower = item.lower()
+                    if lower in seen:
+                        has_dup = True
+                        continue
+                    seen.add(lower)
+                    unique.append(item)
+                if has_dup:
+                    new_text = ", ".join(unique)
+                    pn.setText(new_text)
+                    dup_warn.setText("⚠ 检测到重复进程名，已自动移除")
+                    dup_warn.show()
+                    # 2 秒后自动隐藏
+                    QTimer.singleShot(2000, dup_warn.hide)
+            finally:
+                pn.blockSignals(False)
+
+        pn.textChanged.connect(_dedup_process_name)
+
         mt = srow("内存阈值 % 可用", cfg.get("mem_available_threshold_pct", 15))
         st = srow("备用列表阈值 MB", cfg.get("standby_threshold_mb", 512))
 
@@ -805,6 +872,9 @@ class MemCleanGUI:
                 self.tray.config = cfg
                 self.collector.process_name = cfg["process_name"]
                 self._titlebar.target_lbl.setText(f"目标: {cfg['process_name']}")
+                # 立即重扫进程列表，避免等 5 轮轮询才更新
+                from safe_detector import force_rescan
+                force_rescan()
             except: pass
             dlg.accept()
 

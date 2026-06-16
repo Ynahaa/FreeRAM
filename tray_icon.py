@@ -253,12 +253,14 @@ class MemCleanTray:
                                      is_feedback_cooldown_active)
         from safe_detector import get_cached_game_state
         if not is_feedback_cooldown_active():
-            __, __, game_pid = get_cached_game_state()
-            if game_pid is not None:
-                fb = trim_game_with_feedback(game_pid)
-                if fb["freed_mb"] > 0:
-                    with self._stats_lock:
-                        self.total_freed_mb += fb["freed_mb"]
+            __, __, states, __ = get_cached_game_state()
+            for st in states.values():
+                pid = st.get("pid")
+                if pid is not None and st.get("running"):
+                    fb = trim_game_with_feedback(pid)
+                    if fb["freed_mb"] > 0:
+                        with self._stats_lock:
+                            self.total_freed_mb += fb["freed_mb"]
                     logger.info(
                         f"[反馈修剪] 游戏释放 {fb['freed_mb']:.0f}MB "
                         f"(page fault +{fb['fault_delta']}, "
@@ -292,8 +294,11 @@ class MemCleanTray:
                 try:
                     if self.gui and self.gui.collector:
                         s = self.gui.collector.snapshot()
-                        if s["game_running"]:
-                            gs = " | 游戏中"
+                        states = s.get("game_states", {})
+                        running_names = [
+                            n for n, st in states.items() if st["running"]]
+                        if running_names:
+                            gs = " | " + ", ".join(running_names)
                 except Exception:
                     pass
 
