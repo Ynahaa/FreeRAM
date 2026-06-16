@@ -45,15 +45,19 @@ def memory_is_tight() -> bool:
 
 _game_pid_cache: int | None = None
 _game_proc_cache = None
+_game_cpu_cache: float = 0.0
+_game_running_cache: bool = False
 _pid_check_counter = 0
 
+
 def is_game_idle(process_name: str = "DeltaForceClient.exe") -> bool:
-    global _game_pid_cache, _game_proc_cache, _pid_check_counter
+    global _game_pid_cache, _game_proc_cache, _game_cpu_cache, _game_running_cache, _pid_check_counter
     _pid_check_counter += 1
 
     if _pid_check_counter >= 5 or _game_pid_cache is None:
         _pid_check_counter = 0
         _game_pid_cache = None; _game_proc_cache = None
+        _game_running_cache = False
         targets = [n.strip().lower() for n in process_name.split(",") if n.strip()]
         for proc in psutil.process_iter(["name", "pid"]):
             try:
@@ -67,15 +71,28 @@ def is_game_idle(process_name: str = "DeltaForceClient.exe") -> bool:
             if _game_proc_cache is None or _game_proc_cache.pid != _game_pid_cache:
                 _game_proc_cache = psutil.Process(_game_pid_cache)
             if _game_proc_cache.is_running():
-                try: cpu = _game_proc_cache.cpu_percent()
-                except: cpu = 0.0
-                return cpu < GAME_CPU_IDLE_THRESHOLD
+                try:
+                    _game_cpu_cache = _game_proc_cache.cpu_percent()
+                except Exception:
+                    _game_cpu_cache = 0.0
+                _game_running_cache = True
+                return _game_cpu_cache < GAME_CPU_IDLE_THRESHOLD
             else:
                 _game_pid_cache = None; _game_proc_cache = None
+                _game_running_cache = False
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             _game_pid_cache = None; _game_proc_cache = None
+            _game_running_cache = False
 
     return True
+
+
+def get_cached_game_state() -> tuple[bool, float, int | None]:
+    """
+    返回缓存的游戏状态——供 GUI DataCollector 复用，避免重复扫描进程列表。
+    返回 (运行中, CPU%, PID)。由 is_game_idle() 每 5 秒更新缓存。
+    """
+    return (_game_running_cache, _game_cpu_cache, _game_pid_cache)
 
 # ── 前台窗口 ──────────────────────────────────────────
 def _get_foreground_process_name() -> str | None:

@@ -221,7 +221,7 @@ class MemCleanTray:
     # ── 后台修剪 ──────────────────────────────────────
 
     def _try_background_trim(self):
-        """修剪后台进程（需配置开启 + 冷却通过）。"""
+        """修剪后台进程 + 降级非关键进程优先级（需配置开启 + 冷却通过）。"""
         if not self.config.get("trim_background", False):
             return
         critical_only = self.config.get("trim_bg_critical_only", True)
@@ -235,6 +235,36 @@ class MemCleanTray:
             return
 
         logger.info("[后台修剪] 开始扫描...")
+
+        # Tier 4：降级非关键进程优先级（温和，不做冷却判断）
+        from memory_cleaner import demote_background_processes
+        demoted = demote_background_processes(self.config, self.process_name)
+        if demoted:
+            logger.info(f"[优先级降级] {demoted} 个进程已降为后台模式")
+
+        # Tier 2：游戏工作集保留 + 非游戏上限
+        from memory_cleaner import apply_working_set_limits
+        limited = apply_working_set_limits(self.config, self.process_name)
+        if limited:
+            logger.info(f"[工作集限制] {limited} 个进程已应用")
+
+        # Tier 3：游戏进程反馈式修剪（PageFaultCount 监控）
+        from memory_cleaner import (trim_game_with_feedback,
+                                     is_feedback_cooldown_active)
+        from safe_detector import get_cached_game_state
+        if not is_feedback_cooldown_active():
+            __, __, game_pid = get_cached_game_state()
+            if game_pid is not None:
+                fb = trim_game_with_feedback(game_pid)
+                if fb["freed_mb"] > 0:
+                    with self._stats_lock:
+                        self.total_freed_mb += fb["freed_mb"]
+                    logger.info(
+                        f"[反馈修剪] 游戏释放 {fb['freed_mb']:.0f}MB "
+                        f"(page fault +{fb['fault_delta']}, "
+                        f"safe={fb['safe']})")
+
+        # Tier 1：激进修剪后台进程工作集
         results = trim_background_processes(self.config, self.process_name)
         if results:
             total_freed = sum(r[2] - r[3] for r in results)

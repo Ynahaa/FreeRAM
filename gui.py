@@ -65,13 +65,9 @@ class DataCollector:
         self.total_freed_mb = 0.0; self.is_paused = False; self.last_clean_time = ""
         self.clean_history: list = []   # [(time_str, freed_mb, reason), ...]
         self._was_game_running = False
-        self._game_pid = None; self._game_proc = None; self._pid_check_counter = 0
         self._on_game_state_change = None
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
-
-    def _target_names(self) -> list:
-        return [n.strip().lower() for n in self.process_name.split(",") if n.strip()]
 
     def _loop(self):
         import psutil
@@ -85,26 +81,12 @@ class DataCollector:
                     standby_mb = _get_standby_size_mb(mem)
                 except: standby_mb = 0.0
 
-                game_running, game_cpu = False, 0.0
-                targets = self._target_names()
-                self._pid_check_counter += 1
-                if self._pid_check_counter >= 5 or self._game_pid is None:
-                    self._pid_check_counter = 0; self._game_pid = None; self._game_proc = None
-                    for proc in psutil.process_iter(["name", "pid"]):
-                        try:
-                            if proc.info["name"].lower() in targets:
-                                self._game_pid = proc.info["pid"]; break
-                        except: continue
-                if self._game_pid is not None:
-                    try:
-                        if self._game_proc is None or self._game_proc.pid != self._game_pid:
-                            self._game_proc = psutil.Process(self._game_pid)
-                        if self._game_proc.is_running():
-                            game_running = True
-                            try: game_cpu = self._game_proc.cpu_percent()
-                            except: game_cpu = 0.0
-                        else: self._game_pid = None; self._game_proc = None
-                    except: self._game_pid = None; self._game_proc = None
+                # 游戏状态：复用 safe_detector 的共享缓存（避免重复扫描进程列表）
+                try:
+                    from safe_detector import get_cached_game_state
+                    game_running, game_cpu, _ = get_cached_game_state()
+                except Exception:
+                    game_running, game_cpu = False, 0.0
 
                 if game_running != self._was_game_running:
                     self._was_game_running = game_running

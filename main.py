@@ -44,6 +44,8 @@ DEFAULT_CONFIG = {
     "trim_bg_max_count": 20,
     "trim_bg_cooldown_sec": 300,
     "trim_bg_exclude": [],
+    "game_reserve_ws_mb": 4096,
+    "non_game_cap_ws_mb": 1024,
     "auto_start": False,
     "dark_mode": False,
 }

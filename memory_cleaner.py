@@ -21,6 +21,7 @@ SystemMemoryListInformation = 0x50
 SE_INC_WORKING_SET_NAME = "SeIncreaseWorkingSetPrivilege"
 SE_PROF_SINGLE_PROCESS_NAME = "SeProfileSingleProcessPrivilege"
 PROCESS_SET_QUOTA = 0x0100
+PROCESS_SET_INFORMATION = 0x0200
 MEM_COMMIT = 0x1000
 MEM_RESET = 0x80000
 PAGE_READWRITE = 0x04
@@ -37,6 +38,24 @@ class TOKEN_PRIVILEGES(Structure):
         ("PrivilegeCount", ctypes.c_ulong),
         ("Privileges", LUID_AND_ATTRIBUTES * 1),
     ]
+
+
+class PROCESS_MEMORY_COUNTERS(Structure):
+    _fields_ = [
+        ("cb", wintypes.DWORD),
+        ("PageFaultCount", wintypes.DWORD),
+        ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t),
+    ]
+
+
+PROCESS_QUERY_INFORMATION = 0x0400
 
 # ── DLL 绑定 ──────────────────────────────────────────
 k32 = ctypes.windll.kernel32
@@ -193,16 +212,139 @@ BACKGROUND_EXEMPT = {
     "freeram.exe", "python.exe", "pythonw.exe",
 }
 
+
+def _is_system_process(pid: int) -> bool:
+    """通过可执行文件路径判断是否为 Windows 系统进程。
+    覆盖 C:\\Windows\\System32、SysWOW64 等子目录，
+    捕获白名单里没有的新系统进程名。"""
+    try:
+        exe_path = psutil.Process(pid).exe().lower()
+        return exe_path.startswith(r"c:\windows\")
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+        return True  # 读不到路径 → 保守处理，当作系统进程不碰
+
+
+# ── 清理四：优先级降级 ──────────────────────────────
+
+PROCESS_MODE_BACKGROUND_BEGIN = 0x00100000  # Win8+
+
+_PRIORITY_DEMOTED: set[int] = set()  # 已降级的 PID，避免重复操作
+
+
+def demote_background_processes(config: dict, game_process: str = "") -> int:
+    """
+    对非游戏、非系统的后台进程降级为后台模式（CPU / I/O / 内存优先级降低）。
+    返回降级成功的进程数。
+    """
+    global _PRIORITY_DEMOTED
+    if not config.get("trim_background", False):
+        return 0
+
+    game_targets = {n.strip().lower() for n in game_process.split(",") if n.strip()}
+    user_exclude = {n.lower() for n in config.get("trim_bg_exclude", [])}
+    our_pid = os.getpid()
+    count = 0
+
+    for proc in psutil.process_iter(["name", "pid"]):
+        try:
+            name = proc.info["name"]
+            pid = proc.info["pid"]
+            nl = name.lower()
+
+            if pid == our_pid: continue
+            if pid in _PRIORITY_DEMOTED: continue
+            if nl in BACKGROUND_EXEMPT: continue
+            if _is_system_process(pid): continue
+            if nl in user_exclude: continue
+            if nl in game_targets: continue
+
+            h = k32.OpenProcess(PROCESS_SET_INFORMATION, False, pid)
+            if h:
+                k32.SetPriorityClass(h, PROCESS_MODE_BACKGROUND_BEGIN)
+                k32.CloseHandle(h)
+                _PRIORITY_DEMOTED.add(pid)
+                count += 1
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            continue
+
+    return count
+
+
+# ── 清理五：工作集保留/上限 ─────────────────────────
+
+_WS_LIMITED: set[int] = set()  # 已设过工作集限制的 PID，避免每轮重复系统调用
+
+
+def apply_working_set_limits(config: dict, game_process: str = "") -> int:
+    """
+    Tier 2：给游戏进程设最小工作集（内核强制执行，物理页被保留）；
+    给非游戏大进程设最大工作集上限（仅当当前工作集超过上限时才设）。
+    每个 PID 只设一次，避免每轮重复 OpenProcess + SetProcessWorkingSetSize。
+    返回受影响的进程数。
+    """
+    global _WS_LIMITED
+    if not config.get("trim_background", False):
+        return 0
+
+    game_reserve_mb = config.get("game_reserve_ws_mb", 4096)
+    non_game_cap_mb = config.get("non_game_cap_ws_mb", 1024)
+    game_targets = {n.strip().lower() for n in game_process.split(",") if n.strip()}
+    user_exclude = {n.lower() for n in config.get("trim_bg_exclude", [])}
+    our_pid = os.getpid()
+    count = 0
+
+    for proc in psutil.process_iter(["name", "pid"]):
+        try:
+            name = proc.info["name"]
+            pid = proc.info["pid"]
+            nl = name.lower()
+
+            if pid == our_pid: continue
+            if pid in _WS_LIMITED: continue       # 已设过限制，跳过
+            if nl in BACKGROUND_EXEMPT: continue
+            if _is_system_process(pid): continue
+            if nl in user_exclude: continue
+
+            h = k32.OpenProcess(PROCESS_SET_QUOTA, False, pid)
+            if not h:
+                continue
+
+            if nl in game_targets:
+                # 游戏进程：保留最小工作集
+                min_ws = game_reserve_mb * 1024 * 1024
+                max_ws = min_ws * 4  # 不实际限制，只保下限
+                k32.SetProcessWorkingSetSize(h, ctypes.c_size_t(min_ws),
+                                             ctypes.c_size_t(max_ws))
+                _WS_LIMITED.add(pid)
+                count += 1
+            else:
+                # 非游戏进程：只有当前工作集超过上限才设
+                cap_ws = non_game_cap_mb * 1024 * 1024
+                cur_ws = _get_working_set_size(h)
+                if cur_ws > cap_ws:
+                    k32.SetProcessWorkingSetSize(
+                        h, ctypes.c_size_t(64 * 1024 * 1024),
+                        ctypes.c_size_t(cap_ws))
+                    _WS_LIMITED.add(pid)
+                    count += 1
+
+            k32.CloseHandle(h)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            continue
+
+    return count
+
+
 def trim_background_processes(config: dict, game_process: str = "") -> list:
     """
-    遍历所有进程，对符合条件的后台进程执行 EmptyWorkingSet。
+    遍历所有进程，按工作集大小降序对符合条件的后台进程执行 EmptyWorkingSet。
+    无数量上限、无 CPU 闲置限制——大工作集进程无论 CPU 占用多少都该压。
     返回 [(name, pid, before_mb, after_mb), ...] 列表。
     """
     if not config.get("trim_background", False):
         return []
 
     min_working_mb = config.get("trim_bg_min_working_mb", 50)
-    max_count = config.get("trim_bg_max_count", 20)
     user_exclude = {n.lower() for n in config.get("trim_bg_exclude", [])}
     game_targets = {n.strip().lower() for n in game_process.split(",") if n.strip()}
     our_pid = os.getpid()
@@ -215,18 +357,11 @@ def trim_background_processes(config: dict, game_process: str = "") -> list:
     except Exception:
         fg_pid = 0
 
-    # CPU 预热：psutil 首次 cpu_percent 总是 0，先采样一次丢弃
-    try:
-        _ = [p.info["cpu_percent"] for p in psutil.process_iter(["cpu_percent"])]
-    except: pass
-
-    results = []
     now = time.time()
-    count = 0
 
-    for proc in psutil.process_iter(["name", "pid", "memory_info", "cpu_percent", "create_time"]):
-        if count >= max_count:
-            break
+    # 第一遍：收集所有候选进程（仅安全检查，不限制数量和 CPU）
+    candidates = []
+    for proc in psutil.process_iter(["name", "pid", "memory_info", "create_time"]):
         try:
             name = proc.info["name"]
             pid = proc.info["pid"]
@@ -235,6 +370,7 @@ def trim_background_processes(config: dict, game_process: str = "") -> list:
             # 安全检查
             if pid == our_pid: continue
             if nl in BACKGROUND_EXEMPT: continue
+            if _is_system_process(pid): continue
             if nl in user_exclude: continue
             if nl in game_targets: continue
             if pid == fg_pid: continue
@@ -245,21 +381,25 @@ def trim_background_processes(config: dict, game_process: str = "") -> list:
             wsmb = ws.WorkingSetSize / 1048576
             if wsmb < min_working_mb: continue
 
-            # CPU 检查（< 3% 才是闲置）
-            cpu = proc.info["cpu_percent"]
-            if cpu is not None and cpu >= 3.0: continue
-
-            # 存活时间检查（> 60 秒）
+            # 存活时间检查（> 60 秒，防止修剪正在初始化的进程）
             ct = proc.info["create_time"]
             if ct is not None and (now - ct) < 60: continue
 
-            # 执行修剪
+            candidates.append((name, pid, wsmb))
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            continue
+
+    # 按工作集大小降序：优先处理最占内存的进程
+    candidates.sort(key=lambda x: x[2], reverse=True)
+
+    # 第二遍：执行修剪
+    results = []
+    for name, pid, before_ws in candidates:
+        try:
             h = k32.OpenProcess(PROCESS_SET_QUOTA, False, pid)
             if h:
-                before_ws = wsmb
                 papi.EmptyWorkingSet(h)
                 k32.CloseHandle(h)
-                # 读修剪后的工作集
                 try:
                     after_ws = psutil.Process(pid).memory_info().WorkingSetSize / 1048576
                 except Exception:
@@ -268,11 +408,79 @@ def trim_background_processes(config: dict, game_process: str = "") -> list:
                 if freed > 0:
                     results.append((name, pid, before_ws, after_ws))
                     logger.info(f"[修剪后台] {name} (PID {pid}): {before_ws:.0f}MB → {after_ws:.0f}MB")
-                count += 1
         except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             continue
 
     return results
+
+
+# ── 清理六：反馈式游戏修剪 (Tier 3) ────────────────
+
+_FAULT_THRESHOLD = 500      # 0.5 秒内 page fault 增量超过此值视为触碰热页
+_FEEDBACK_COOLDOWN_SEC = 0.0  # 上次触碰热页的时间戳，用于动态延长冷却
+
+
+def _get_page_fault_count(process_handle) -> int:
+    """读取进程的累计 PageFaultCount。"""
+    pmc = PROCESS_MEMORY_COUNTERS()
+    pmc.cb = sizeof(pmc)
+    if papi.GetProcessMemoryInfo(process_handle, byref(pmc), sizeof(pmc)):
+        return pmc.PageFaultCount
+    return -1
+
+
+def _get_working_set_size(process_handle) -> int:
+    """读取进程当前工作集大小（字节）。"""
+    pmc = PROCESS_MEMORY_COUNTERS()
+    pmc.cb = sizeof(pmc)
+    if papi.GetProcessMemoryInfo(process_handle, byref(pmc), sizeof(pmc)):
+        return pmc.WorkingSetSize
+    return 0
+
+
+def trim_game_with_feedback(game_pid: int) -> dict:
+    """
+    Tier 3：对游戏进程执行 EmptyWorkingSet，监控 PageFaultCount 副作用。
+    触碰热页时标记 unsafe 并动态延长冷却。
+    返回 {"freed_mb": float, "safe": bool, "fault_delta": int}
+    """
+    global _FEEDBACK_COOLDOWN_SEC
+
+    h = k32.OpenProcess(PROCESS_SET_QUOTA | PROCESS_QUERY_INFORMATION,
+                        False, game_pid)
+    if not h:
+        return {"freed_mb": 0, "safe": False, "fault_delta": 0}
+
+    before_faults = _get_page_fault_count(h)
+    before_ws = _get_working_set_size(h)
+
+    papi.EmptyWorkingSet(h)
+    time.sleep(0.5)  # 等待 page fault 积累
+
+    after_faults = _get_page_fault_count(h)
+    after_ws = _get_working_set_size(h)
+    k32.CloseHandle(h)
+
+    fault_delta = after_faults - before_faults if before_faults >= 0 else 0
+    freed_mb = round((before_ws - after_ws) / 1048576, 1) if after_ws < before_ws else 0
+
+    safe = fault_delta <= _FAULT_THRESHOLD
+    if not safe:
+        logger.warning(
+            f"[反馈修剪] 游戏 PID {game_pid}: page fault 暴增 {fault_delta} "
+            f"(释放 {freed_mb:.0f}MB) — 触碰热页，延长冷却")
+        _FEEDBACK_COOLDOWN_SEC = time.time() + 120  # 额外冷却 2 分钟
+    else:
+        logger.info(
+            f"[反馈修剪] 游戏 PID {game_pid}: 安全释放 {freed_mb:.0f}MB "
+            f"(page fault +{fault_delta})")
+
+    return {"freed_mb": max(0, freed_mb), "safe": safe, "fault_delta": fault_delta}
+
+
+def is_feedback_cooldown_active() -> bool:
+    """反馈修剪是否处于冷却期（触碰过热页后延长冷却）。"""
+    return time.time() < _FEEDBACK_COOLDOWN_SEC
 
 
 # ── 组合 ──────────────────────────────────────────────
