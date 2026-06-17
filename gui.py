@@ -423,17 +423,17 @@ class MemCleanGUI:
         cards = QHBoxLayout()
         cards.setSpacing(10)
 
-        # 游戏状态卡片
+        # 游戏状态卡片 (50%)
         game_card, self.game_dot, self.game_label = self._make_info_card("🎮 游戏状态", "●", "未运行")
-        cards.addWidget(game_card)
+        cards.addWidget(game_card, 5)
 
-        # 清理统计卡片
+        # 清理统计卡片 (30%)
         stats_card, _, self.stats_label = self._make_info_card("📊 清理统计", "", "暂无清理")
-        cards.addWidget(stats_card)
+        cards.addWidget(stats_card, 3)
 
-        # 监控状态卡片
+        # 监控状态卡片 (20%)
         monitor_card, self.monitor_dot, self.monitor_label = self._make_info_card("⚙ 监控", "●", "监控中")
-        cards.addWidget(monitor_card)
+        cards.addWidget(monitor_card, 2)
 
         cl.addLayout(cards)
 
@@ -567,11 +567,11 @@ class MemCleanGUI:
                             any_running = True
                             lines.append(
                                 f'<span style="color:{green};">●</span> {name}'
-                                f'  CPU {st["cpu"]:.0f}%')
+                                f'  | CPU{st["cpu"]:.0f}% | 内存{st["ws_mb"]:.0f}MB')
                         else:
                             lines.append(
                                 f'<span style="color:{gray};">○</span> {name}'
-                                f'  未运行')
+                                f'  | 未运行')
                     self.game_dot.setStyleSheet(
                         f"color: {green if any_running else gray}; font-size: 12px; "
                         f"border: none; background: transparent;")

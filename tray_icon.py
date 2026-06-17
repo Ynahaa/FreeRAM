@@ -255,12 +255,12 @@ class MemCleanTray:
         if not is_feedback_cooldown_active():
             __, __, states, __ = get_cached_game_state()
             for st in states.values():
-                pid = st.get("pid")
-                if pid is not None and st.get("running"):
-                    fb = trim_game_with_feedback(pid)
-                    if fb["freed_mb"] > 0:
-                        with self._stats_lock:
-                            self.total_freed_mb += fb["freed_mb"]
+                if st.get("running"):
+                    for pid in st.get("pids", []):
+                        fb = trim_game_with_feedback(pid)
+                        if fb["freed_mb"] > 0:
+                            with self._stats_lock:
+                                self.total_freed_mb += fb["freed_mb"]
                     logger.info(
                         f"[反馈修剪] 游戏释放 {fb['freed_mb']:.0f}MB "
                         f"(page fault +{fb['fault_delta']}, "
